@@ -1,0 +1,10 @@
+# Compiled binaries
+client
+server
+
+# Object files
+*.o
+*.obj
+
+# macOS
+.DS_Store
