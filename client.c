@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <errno.h> // Added for errno and ERANGE
 
 #define MULTICAST_ADDR "239.0.0.1"
 #define PORT 12345
@@ -13,16 +14,26 @@
 #define PACKET_SIZE 1024
 #define MAX_PACKETS 2000000 // Upto 2M packets per 5s interval
 #define HELLO_INTERVAL_S 0.5
+#include "common.h" // Include common.h
+#include <limits.h> // For LONG_MIN, LONG_MAX
 
-// For qsort
-int compare_doubles(const void *a, const void *b) {
-    double da = *(const double *)a;
-    double db = *(const double *)b;
-    if (da < db) return -1;
-    if (da > db) return 1;
-    return 0;
+static long parse_long(const char *s, const char *arg_name, int *error_flag) {
+    char *endptr;
+    long val = strtol(s, &endptr, 10);
+
+    if (endptr == s || *endptr != '\0') {
+        fprintf(stderr, "Error: Invalid number for %s: %s\n", arg_name, s);
+        *error_flag = 1;
+        return 0; // Or some other appropriate error value
+    }
+
+    if ((val == LONG_MIN || val == LONG_MAX) && errno == ERANGE) {
+        fprintf(stderr, "Error: Value out of range for %s: %s\n", arg_name, s);
+        *error_flag = 1;
+        return 0;
+    }
+    return val;
 }
-
 int main(int argc, char **argv) {
     int ret = 0;
     int sockfd = -1;
@@ -41,39 +52,65 @@ int main(int argc, char **argv) {
     const char *mcast_addr_str = MULTICAST_ADDR;
     const char *join_iface_ip = NULL;
     int rcvbuf_cli = -1; // optional CLI override
+    int parse_error = 0; // Flag to indicate parsing errors
+    double *inter_arrival_times = NULL; // Declared and initialized here
+
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ctrl-ip") == 0 && i + 1 < argc) {
             ctrl_ip_arg = argv[++i];
         } else if (strcmp(argv[i], "--hello-interval") == 0 && i + 1 < argc) {
-            hello_interval_s = atof(argv[++i]);
+            hello_interval_s = strtod(argv[++i], NULL);
+            if (hello_interval_s <= 0) {
+                fprintf(stderr, "Error: --hello-interval must be a positive number.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--ctrl-port") == 0 && i + 1 < argc) {
-            ctrl_port = atoi(argv[++i]);
+            ctrl_port = (int)parse_long(argv[++i], "--ctrl-port", &parse_error);
+            if (ctrl_port <= 0 || ctrl_port > 65535) {
+                fprintf(stderr, "Error: --ctrl-port must be between 1 and 65535.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--data-port") == 0 && i + 1 < argc) {
-            data_port = atoi(argv[++i]);
+            data_port = (int)parse_long(argv[++i], "--data-port", &parse_error);
+            if (data_port <= 0 || data_port > 65535) {
+                fprintf(stderr, "Error: --data-port must be between 1 and 65535.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--mcast-addr") == 0 && i + 1 < argc) {
             mcast_addr_str = argv[++i];
         } else if (strcmp(argv[i], "--iface") == 0 && i + 1 < argc) {
             join_iface_ip = argv[++i];
         } else if (strcmp(argv[i], "--rcvbuf") == 0 && i + 1 < argc) {
-            rcvbuf_cli = atoi(argv[++i]);
+            rcvbuf_cli = (int)parse_long(argv[++i], "--rcvbuf", &parse_error);
+            if (rcvbuf_cli < 0) { // rcvbuf can be 0, but generally not useful
+                fprintf(stderr, "Error: --rcvbuf must be a non-negative number.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP] [--rcvbuf BYTES]\n", argv[0]);
-            return 0;
+            ret = 0;
+            goto cleanup;
         } else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP] [--rcvbuf BYTES]\n", argv[0]);
-            return 1;
+            parse_error = 1;
         }
     }
 
-    double *inter_arrival_times = malloc(MAX_PACKETS * sizeof(double));
+    if (parse_error) {
+        fprintf(stderr, "Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP] [--rcvbuf BYTES]\n", argv[0]);
+        ret = 1;
+        goto cleanup;
+    }
+
+    inter_arrival_times = malloc(MAX_PACKETS * sizeof(double));
     if (inter_arrival_times == NULL) {
         perror("malloc");
         ret = 1;
         goto cleanup;
     }
     long packet_count = 0;
+
 
 
     // Create a UDP socket
@@ -112,9 +149,7 @@ int main(int argc, char **argv) {
 
 #ifdef SO_REUSEPORT
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, (char *)&reuse, sizeof(reuse)) < 0) {
-        perror("setsockopt (SO_REUSEPORT)");
-        ret = 1;
-        goto cleanup;
+        fprintf(stderr, "Warning: setsockopt (SO_REUSEPORT) failed: %s. Continuing without it.\n", strerror(errno));
     }
 #endif
 
@@ -229,7 +264,10 @@ int main(int argc, char **argv) {
             first_packet = 0;
         }
 
-        // HELLO sending logic, now correctly placed outside the FD_ISSET block
+        // Recompute now after select to avoid stale timing
+        gettimeofday(&now, NULL);
+        since_hello = (now.tv_sec - last_hello_time.tv_sec) +
+                      (now.tv_usec - last_hello_time.tv_usec) / 1e6;
         if (since_hello >= hello_interval_s) {
             const char *msg = "HELLO";
             ssize_t sn = sendto(ctrlfd, msg, strlen(msg), 0, (struct sockaddr *)&ctrl_srv, sizeof(ctrl_srv));
@@ -239,7 +277,6 @@ int main(int argc, char **argv) {
             last_hello_time = now;
         }
 
-
         // Get the current time
         gettimeofday(&current_time, NULL);
 
@@ -247,18 +284,20 @@ int main(int argc, char **argv) {
         double elapsed_time = (current_time.tv_sec - start_time.tv_sec) + (current_time.tv_usec - start_time.tv_usec) / 1e6;
 
         if (elapsed_time >= 5.0) { // Report every 5 seconds
-            double throughput_mbps = (total_bytes_received * 8) / (elapsed_time * 1e6);
-            printf("Throughput: %.2f Mbps\n", throughput_mbps);
+            if (total_bytes_received > 0 || packet_count > 0) {
+                double throughput_mbps = (total_bytes_received * 8) / (elapsed_time * 1e6);
+                printf("Throughput: %.2f Mbps\n", throughput_mbps);
 
-            if (packet_count > 0) {
-                qsort(inter_arrival_times, packet_count, sizeof(double), compare_doubles);
-                size_t idx50 = (size_t)((packet_count - 1) * 0.50);
-                size_t idx95 = (size_t)((packet_count - 1) * 0.95);
-                size_t idx99 = (size_t)((packet_count - 1) * 0.99);
-                double p50 = inter_arrival_times[idx50];
-                double p95 = inter_arrival_times[idx95];
-                double p99 = inter_arrival_times[idx99];
-                printf("Inter-packet arrival (ms): p50: %.2f, p95: %.2f, p99: %.2f\n", p50, p95, p99);
+                if (packet_count > 0) {
+                    qsort(inter_arrival_times, packet_count, sizeof(double), compare_doubles);
+                    size_t idx50 = (size_t)((packet_count - 1) * 0.50);
+                    size_t idx95 = (size_t)((packet_count - 1) * 0.95);
+                    size_t idx99 = (size_t)((packet_count - 1) * 0.99);
+                    double p50 = inter_arrival_times[idx50];
+                    double p95 = inter_arrival_times[idx95];
+                    double p99 = inter_arrival_times[idx99];
+                    printf("Inter-packet arrival (ms): p50: %.2f, p95: %.2f, p99: %.2f\n", p50, p95, p99);
+                }
             }
 
             // Reset counters

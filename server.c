@@ -19,6 +19,28 @@
 #define MAX_CLIENTS 128
 #define MAX_PACKETS 2000000 // Up to 2M packets per 5s interval
 #define LOOP_SLEEP_NS 100000 // 100us
+#include "common.h" // Include common.h
+#include <limits.h> // For LONG_MIN, LONG_MAX
+
+static long parse_long(const char *s, const char *arg_name, int *error_flag) {
+    char *endptr;
+    long val = strtol(s, &endptr, 10);
+
+    if (endptr == s || *endptr != '\0') {
+        fprintf(stderr, "Error: Invalid number for %s: %s\n", arg_name, s);
+        *error_flag = 1;
+        return 0; // Or some other appropriate error value
+    }
+
+    if ((val == LONG_MIN || val == LONG_MAX) && errno == ERANGE) {
+        fprintf(stderr, "Error: Value out of range for %s: %s\n", arg_name, s);
+        *error_flag = 1;
+        return 0;
+    }
+    return val;
+}
+
+
 
 struct client_entry {
     in_addr_t ip;
@@ -36,15 +58,6 @@ static int find_client(struct client_entry *clients, int count, in_addr_t ip) {
 
 static double elapsed_since(const struct timeval *now, const struct timeval *then) {
     return (now->tv_sec - then->tv_sec) + (now->tv_usec - then->tv_usec) / 1e6;
-}
-
-// For qsort
-int compare_doubles(const void *a, const void *b) {
-    double da = *(const double *)a;
-    double db = *(const double *)b;
-    if (da < db) return -1;
-    if (da > db) return 1;
-    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -74,20 +87,41 @@ int main(int argc, char **argv) {
     long send_count = 0;
     struct timeval last_send_time;
     int first_send = 1;
+    int parse_error = 0; // Flag to indicate parsing errors
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--client-timeout") == 0 && i + 1 < argc) {
-            client_timeout_s = atof(argv[++i]);
+            client_timeout_s = strtod(argv[++i], NULL);
+            if (client_timeout_s <= 0) {
+                fprintf(stderr, "Error: --client-timeout must be a positive number.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--ctrl-port") == 0 && i + 1 < argc) {
-            ctrl_port = atoi(argv[++i]);
+            ctrl_port = (int)parse_long(argv[++i], "--ctrl-port", &parse_error);
+            if (ctrl_port <= 0 || ctrl_port > 65535) {
+                fprintf(stderr, "Error: --ctrl-port must be between 1 and 65535.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--data-port") == 0 && i + 1 < argc) {
-            data_port = atoi(argv[++i]);
+            data_port = (int)parse_long(argv[++i], "--data-port", &parse_error);
+            if (data_port <= 0 || data_port > 65535) {
+                fprintf(stderr, "Error: --data-port must be between 1 and 65535.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--mcast-addr") == 0 && i + 1 < argc) {
             mcast_addr_str = argv[++i];
         } else if (strcmp(argv[i], "--ttl") == 0 && i + 1 < argc) {
-            mcast_ttl = atoi(argv[++i]);
+            mcast_ttl = (int)parse_long(argv[++i], "--ttl", &parse_error);
+            if (mcast_ttl < 0 || mcast_ttl > 255) {
+                fprintf(stderr, "Error: --ttl must be between 0 and 255.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--loop") == 0 && i + 1 < argc) {
-            mcast_loop = atoi(argv[++i]);
+            mcast_loop = (int)parse_long(argv[++i], "--loop", &parse_error);
+            if (mcast_loop != 0 && mcast_loop != 1) {
+                fprintf(stderr, "Error: --loop must be 0 or 1.\n");
+                parse_error = 1;
+            }
         } else if (strcmp(argv[i], "--iface") == 0 && i + 1 < argc) {
             mcast_iface_ip = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -96,11 +130,16 @@ int main(int argc, char **argv) {
             goto cleanup;
         } else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE_IP]\n", argv[0]);
-            ret = 1;
-            goto cleanup;
+            parse_error = 1;
         }
     }
+
+    if (parse_error) {
+        fprintf(stderr, "Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE_IP]\n", argv[0]);
+        ret = 1;
+        goto cleanup;
+    }
+
 
     // Create a UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -268,21 +307,23 @@ int main(int argc, char **argv) {
         double elapsed_time = (current_time.tv_sec - start_time.tv_sec) + (current_time.tv_usec - start_time.tv_usec) / 1e6;
 
         if (elapsed_time >= SEND_INTERVAL_S) {
-            double throughput_mbps = (total_bytes_sent * 8) / (elapsed_time * 1e6);
-            printf("Throughput: %.2f Mbps\n", throughput_mbps);
+            if (total_bytes_sent > 0 || send_count > 0) {
+                double throughput_mbps = (total_bytes_sent * 8) / (elapsed_time * 1e6);
+                printf("Throughput: %.2f Mbps\n", throughput_mbps);
 
-            if (send_count > 0) {
-                qsort(inter_send_times, send_count, sizeof(double), compare_doubles);
-                size_t idx50 = (size_t)((send_count - 1) * 0.50);
-                size_t idx95 = (size_t)((send_count - 1) * 0.95);
-                size_t idx99 = (size_t)((send_count - 1) * 0.99);
-                double p50 = inter_send_times[idx50];
-                double p95 = inter_send_times[idx95];
-                double p99 = inter_send_times[idx99];
-                printf("Inter-packet send (ms): p50: %.2f, p95: %.2f, p99: %.2f\n", p50, p95, p99);
+                if (send_count > 0) {
+                    qsort(inter_send_times, send_count, sizeof(double), compare_doubles);
+                    size_t idx50 = (size_t)((send_count - 1) * 0.50);
+                    size_t idx95 = (size_t)((send_count - 1) * 0.95);
+                    size_t idx99 = (size_t)((send_count - 1) * 0.99);
+                    double p50 = inter_send_times[idx50];
+                    double p95 = inter_send_times[idx95];
+                    double p99 = inter_send_times[idx99];
+                    printf("Inter-packet send (ms): p50: %.2f, p95: %.2f, p99: %.2f\n", p50, p95, p99);
+                }
             }
 
-            // Reset counters
+            // Reset counters regardless
             total_bytes_sent = 0;
             send_count = 0;
             first_send = 1;

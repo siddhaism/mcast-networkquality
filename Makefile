@@ -3,12 +3,15 @@ CFLAGS = -Wall -Wextra -std=c99
 
 all: server client
 
-server: server.c
-	$(CC) $(CFLAGS) -o server server.c
+server: server.c common.o
+	$(CC) $(CFLAGS) -o server server.c common.o
 
-client: client.c
-	$(CC) $(CFLAGS) -o client client.c
+client: client.c common.o
+	$(CC) $(CFLAGS) -o client client.c common.o
+
+common.o: common.c common.h
+	$(CC) $(CFLAGS) -c common.c
 
 clean:
-	rm -f server client
+	rm -f server client common.o
 
