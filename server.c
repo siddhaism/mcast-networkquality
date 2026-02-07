@@ -48,8 +48,9 @@ int compare_doubles(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-    int sockfd;
-    int ctrlfd;
+    int ret = 0;
+    int sockfd = -1;
+    int ctrlfd = -1;
     struct sockaddr_in multicast_addr;
     struct sockaddr_in ctrl_addr;
     char packet[PACKET_SIZE];
@@ -67,7 +68,8 @@ int main(int argc, char **argv) {
     double *inter_send_times = malloc(MAX_PACKETS * sizeof(double));
     if (inter_send_times == NULL) {
         perror("malloc");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
     long send_count = 0;
     struct timeval last_send_time;
@@ -90,24 +92,28 @@ int main(int argc, char **argv) {
             mcast_iface_ip = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE_IP]\n", argv[0]);
-            return 0;
+            ret = 0;
+            goto cleanup;
         } else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
             fprintf(stderr, "Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE_IP]\n", argv[0]);
-            return 1;
+            ret = 1;
+            goto cleanup;
         }
     }
 
     // Create a UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     // Create control socket
     if ((ctrlfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket (control)");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     memset(&ctrl_addr, 0, sizeof(ctrl_addr));
@@ -116,14 +122,16 @@ int main(int argc, char **argv) {
     ctrl_addr.sin_port = htons(ctrl_port);
     if (bind(ctrlfd, (struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr)) < 0) {
         perror("bind (control)");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     // Make control socket non-blocking so it doesn't rate-limit sends
     int flags = fcntl(ctrlfd, F_GETFL, 0);
     if (flags < 0 || fcntl(ctrlfd, F_SETFL, flags | O_NONBLOCK) < 0) {
         perror("fcntl (O_NONBLOCK)");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     // Initialize packet payload to a fixed pattern
@@ -132,7 +140,13 @@ int main(int argc, char **argv) {
     // Set up the multicast address
     memset(&multicast_addr, 0, sizeof(multicast_addr));
     multicast_addr.sin_family = AF_INET;
-    multicast_addr.sin_addr.s_addr = inet_addr(mcast_addr_str);
+    struct in_addr maddr;
+    if (inet_aton(mcast_addr_str, &maddr) == 0) {
+        fprintf(stderr, "Invalid multicast address: %s\n", mcast_addr_str);
+        ret = 1;
+        goto cleanup;
+    }
+    multicast_addr.sin_addr = maddr;
     multicast_addr.sin_port = htons(data_port);
 
     printf("Server sending to %s:%d\n", mcast_addr_str, data_port);
@@ -143,22 +157,26 @@ int main(int argc, char **argv) {
         unsigned char ttl_uc = (unsigned char)(mcast_ttl < 0 ? 0 : (mcast_ttl > 255 ? 255 : mcast_ttl));
         if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl_uc, sizeof(ttl_uc)) < 0) {
             perror("setsockopt (IP_MULTICAST_TTL)");
-            exit(EXIT_FAILURE);
+            ret = 1;
+            goto cleanup;
         }
         unsigned char loop_uc = (unsigned char)(mcast_loop ? 1 : 0);
         if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop_uc, sizeof(loop_uc)) < 0) {
             perror("setsockopt (IP_MULTICAST_LOOP)");
-            exit(EXIT_FAILURE);
+            ret = 1;
+            goto cleanup;
         }
         if (mcast_iface_ip) {
             struct in_addr ifaddr;
             if (inet_aton(mcast_iface_ip, &ifaddr) == 0) {
                 fprintf(stderr, "Invalid iface IP: %s\n", mcast_iface_ip);
-                exit(EXIT_FAILURE);
+                ret = 1;
+                goto cleanup;
             }
             if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr)) < 0) {
                 perror("setsockopt (IP_MULTICAST_IF)");
-                exit(EXIT_FAILURE);
+                ret = 1;
+                goto cleanup;
             }
         }
     }
@@ -182,6 +200,9 @@ int main(int argc, char **argv) {
                     clients[client_count].ip = src_addr.sin_addr.s_addr;
                     clients[client_count].last_seen = now;
                     client_count++;
+                } else {
+                    // Optionally, log that max clients has been reached
+                    fprintf(stderr, "Max clients reached, ignoring new client from %s\n", inet_ntoa(src_addr.sin_addr));
                 }
                 continue;
             }
@@ -191,23 +212,34 @@ int main(int argc, char **argv) {
             }
 
             perror("recvfrom (control)");
-            exit(EXIT_FAILURE);
+            ret = 1;
+            goto cleanup;
         }
 
-        // Check for active clients
+        // Check for active clients and remove timed out ones
         struct timeval now;
         gettimeofday(&now, NULL);
         int active = 0;
-        for (int i = 0; i < client_count; i++) {
+        int i = 0;
+        while (i < client_count) {
             if (elapsed_since(&now, &clients[i].last_seen) <= client_timeout_s) {
                 active++;
+                i++;
+            } else {
+                // Client timed out, remove it by shifting subsequent elements
+                fprintf(stderr, "Client %s timed out.\n", inet_ntoa((struct in_addr){clients[i].ip}));
+                client_count--;
+                for (int j = i; j < client_count; j++) {
+                    clients[j] = clients[j+1];
+                }
             }
         }
 
         if (active > 0) {
             if (sendto(sockfd, packet, sizeof(packet), 0, (struct sockaddr *)&multicast_addr, sizeof(multicast_addr)) < 0) {
                 perror("sendto");
-                exit(EXIT_FAILURE);
+                ret = 1;
+                goto cleanup;
             }
             total_bytes_sent += PACKET_SIZE;
 
@@ -217,6 +249,9 @@ int main(int argc, char **argv) {
                 double inter_send_ms = (send_time.tv_sec - last_send_time.tv_sec) * 1e3;
                 inter_send_ms += (send_time.tv_usec - last_send_time.tv_usec) / 1e3;
                 inter_send_times[send_count++] = inter_send_ms;
+            } else if (send_count >= MAX_PACKETS) {
+                // Handle the case where MAX_PACKETS is reached, e.g., log a warning
+                fprintf(stderr, "Warning: MAX_PACKETS reached for inter-send times. Some data will not be recorded.\n");
             }
             last_send_time = send_time;
             first_send = 0;
@@ -255,8 +290,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    free(inter_send_times);
-    close(sockfd);
-    close(ctrlfd);
-    return 0;
+cleanup:
+    if (inter_send_times) free(inter_send_times);
+    if (sockfd >= 0) close(sockfd);
+    if (ctrlfd >= 0) close(ctrlfd);
+    return ret;
 }

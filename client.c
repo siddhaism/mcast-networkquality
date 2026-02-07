@@ -24,8 +24,9 @@ int compare_doubles(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-    int sockfd;
-    int ctrlfd;
+    int ret = 0;
+    int sockfd = -1;
+    int ctrlfd = -1;
     struct sockaddr_in local_addr;
     struct ip_mreq mreq;
     struct sockaddr_in ctrl_srv;
@@ -39,6 +40,7 @@ int main(int argc, char **argv) {
     int data_port = PORT;
     const char *mcast_addr_str = MULTICAST_ADDR;
     const char *join_iface_ip = NULL;
+    int rcvbuf_cli = -1; // optional CLI override
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ctrl-ip") == 0 && i + 1 < argc) {
@@ -53,12 +55,14 @@ int main(int argc, char **argv) {
             mcast_addr_str = argv[++i];
         } else if (strcmp(argv[i], "--iface") == 0 && i + 1 < argc) {
             join_iface_ip = argv[++i];
+        } else if (strcmp(argv[i], "--rcvbuf") == 0 && i + 1 < argc) {
+            rcvbuf_cli = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP]\n", argv[0]);
+            printf("Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP] [--rcvbuf BYTES]\n", argv[0]);
             return 0;
         } else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP] [--rcvbuf BYTES]\n", argv[0]);
             return 1;
         }
     }
@@ -66,7 +70,8 @@ int main(int argc, char **argv) {
     double *inter_arrival_times = malloc(MAX_PACKETS * sizeof(double));
     if (inter_arrival_times == NULL) {
         perror("malloc");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
     long packet_count = 0;
 
@@ -74,13 +79,15 @@ int main(int argc, char **argv) {
     // Create a UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     // Control socket for HELLOs
     if ((ctrlfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket (control)");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     const char *server_ip = ctrl_ip_arg;
@@ -99,20 +106,28 @@ int main(int argc, char **argv) {
     int reuse = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse)) < 0) {
         perror("setsockopt (SO_REUSEADDR)");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
 #ifdef SO_REUSEPORT
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, (char *)&reuse, sizeof(reuse)) < 0) {
         perror("setsockopt (SO_REUSEPORT)");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 #endif
 
-    // Bump receive buffer to reduce drops under load
+    // Configure receive buffer
     {
-        int rcvbuf = 4 * 1024 * 1024; // 4MB
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        int rcvbuf = (rcvbuf_cli > 0) ? rcvbuf_cli : (4 * 1024 * 1024); // default 4MB
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+            perror("setsockopt (SO_RCVBUF)");
+        }
+        socklen_t optlen = sizeof(rcvbuf);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) == 0) {
+            printf("Effective SO_RCVBUF: %d bytes\n", rcvbuf);
+        }
     }
 
     // Set up the local address
@@ -124,11 +139,18 @@ int main(int argc, char **argv) {
     // Bind to the local address
     if (bind(sockfd, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
         perror("bind");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     // Join the multicast group
-    mreq.imr_multiaddr.s_addr = inet_addr(mcast_addr_str);
+    struct in_addr maddr;
+    if (inet_aton(mcast_addr_str, &maddr) == 0) {
+        fprintf(stderr, "Invalid multicast address: %s\n", mcast_addr_str);
+        ret = 1;
+        goto cleanup;
+    }
+    mreq.imr_multiaddr = maddr;
     if (join_iface_ip) {
         mreq.imr_interface.s_addr = inet_addr(join_iface_ip);
     } else {
@@ -136,7 +158,8 @@ int main(int argc, char **argv) {
     }
     if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
         perror("setsockopt (IP_ADD_MEMBERSHIP)");
-        exit(EXIT_FAILURE);
+        ret = 1;
+        goto cleanup;
     }
 
     printf("Client listening on %s:%d\n", mcast_addr_str, data_port);
@@ -150,11 +173,32 @@ int main(int argc, char **argv) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(sockfd, &rfds);
-        struct timeval tv = {0, 200000}; // 200ms
+
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        double since_hello = (now.tv_sec - last_hello_time.tv_sec) +
+                             (now.tv_usec - last_hello_time.tv_usec) / 1e6;
+        double time_to_next_hello = hello_interval_s - since_hello;
+
+        struct timeval tv;
+        if (time_to_next_hello <= 0) {
+            tv.tv_sec = 0;
+            tv.tv_usec = 0; // Send hello immediately
+        } else {
+            tv.tv_sec = (time_t)time_to_next_hello;
+            tv.tv_usec = (suseconds_t)((time_to_next_hello - tv.tv_sec) * 1e6);
+        }
+
+        // Ensure a minimum timeout to avoid busy-waiting if time_to_next_hello is very small
+        if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+            tv.tv_usec = 10000; // 10ms minimum timeout
+        }
+
         int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
         if (rv < 0) {
             perror("select");
-            exit(EXIT_FAILURE);
+            ret = 1;
+            goto cleanup;
         }
 
         if (rv > 0 && FD_ISSET(sockfd, &rfds)) {
@@ -164,7 +208,8 @@ int main(int argc, char **argv) {
             ssize_t nbytes = recvfrom(sockfd, packet, sizeof(packet), 0, (struct sockaddr *)&src_addr, &src_len);
             if (nbytes < 0) {
                 perror("recvfrom");
-                exit(EXIT_FAILURE);
+                ret = 1;
+                goto cleanup;
             }
             
             struct timeval arrival_time;
@@ -176,16 +221,15 @@ int main(int argc, char **argv) {
                 double inter_arrival_time = (arrival_time.tv_sec - last_packet_time.tv_sec) * 1e3;
                 inter_arrival_time += (arrival_time.tv_usec - last_packet_time.tv_usec) / 1e3;
                 inter_arrival_times[packet_count++] = inter_arrival_time;
+            } else if (packet_count >= MAX_PACKETS) {
+                fprintf(stderr, "Warning: MAX_PACKETS reached for inter-arrival times. Some data will not be recorded.\n");
             }
 
             last_packet_time = arrival_time;
             first_packet = 0;
         }
 
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        double since_hello = (now.tv_sec - last_hello_time.tv_sec) +
-                             (now.tv_usec - last_hello_time.tv_usec) / 1e6;
+        // HELLO sending logic, now correctly placed outside the FD_ISSET block
         if (since_hello >= hello_interval_s) {
             const char *msg = "HELLO";
             ssize_t sn = sendto(ctrlfd, msg, strlen(msg), 0, (struct sockaddr *)&ctrl_srv, sizeof(ctrl_srv));
@@ -194,6 +238,7 @@ int main(int argc, char **argv) {
             }
             last_hello_time = now;
         }
+
 
         // Get the current time
         gettimeofday(&current_time, NULL);
@@ -224,8 +269,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    free(inter_arrival_times);
-    close(sockfd);
-    close(ctrlfd);
-    return 0;
+cleanup:
+    if (inter_arrival_times) free(inter_arrival_times);
+    if (sockfd >= 0) close(sockfd);
+    if (ctrlfd >= 0) close(ctrlfd);
+    return ret;
 }
