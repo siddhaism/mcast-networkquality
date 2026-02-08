@@ -8,7 +8,9 @@
       "Bash(gh auth:*)",
       "Bash(git ls-tree:*)",
       "Bash(git remote add:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(cc -Wall -Wextra -o server server.c common.c:*)",
+      "Bash(cc:*)"
     ],
     "deny": [],
     "ask": []

@@ -62,6 +62,7 @@ int main(int argc, char **argv) {
     const char *join_iface_ip = NULL;
     int rcvbuf_cli = -1; // optional CLI override
     int parse_error = 0; // Flag to indicate parsing errors
+    int verbose = 0; // verbose diagnostics
     double *inter_arrival_times = NULL; // Declared and initialized here
 
 
@@ -96,8 +97,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: --rcvbuf must be a non-negative number.\n");
                 parse_error = 1;
             }
+        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP] [--rcvbuf BYTES]\n", argv[0]);
+            printf("Usage: %s [--ctrl-ip IP] [--hello-interval SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--iface IFACE_IP] [--rcvbuf BYTES] [--verbose|-v]\n", argv[0]);
             ret = 0;
             goto cleanup;
         } else {
@@ -205,7 +208,34 @@ int main(int argc, char **argv) {
             }
         } else if (inet_pton(AF_INET6, addrbuf, &maddr6) == 1) {
             data_family = AF_INET6;
+
+            // Resolve interface index first (needed for bind on macOS)
+            unsigned int ifindex = 0;
+            if (zone) {
+                char *endp = NULL; unsigned long z = strtoul(zone, &endp, 10);
+                if (zone[0] != '\0' && *endp == '\0') ifindex = (unsigned int)z;
+                else ifindex = if_nametoindex(zone);
+            }
+            if (ifindex == 0 && join_iface_ip) {
+                ifindex = if_nametoindex(join_iface_ip);
+            }
+            if (ifindex == 0) {
+                fprintf(stderr, "Error: No interface specified for IPv6 multicast. Use --iface or zone ID (%%ifname) in multicast address.\n");
+                ret = 1; goto cleanup;
+            }
+            char ifname[IF_NAMESIZE];
+            if (if_indextoname(ifindex, ifname)) {
+                printf("Using interface for IPv6 multicast: %s (index %u)\n", ifname, ifindex);
+            }
+
             if ((sockfd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) { perror("socket"); ret = 1; goto cleanup; }
+
+            // Set IPV6_V6ONLY to avoid dual-stack issues
+            int v6only = 1;
+            if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0) {
+                perror("setsockopt (IPV6_V6ONLY)");
+            }
+
             // Allow multiple sockets and configure rcvbuf
             int reuse = 1;
             if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse)) < 0) { perror("setsockopt (SO_REUSEADDR)"); ret = 1; goto cleanup; }
@@ -222,31 +252,37 @@ int main(int argc, char **argv) {
                     printf("Effective SO_RCVBUF: %d bytes\n", rcvbuf);
                 }
             }
+
+            // Bind to wildcard address on the specific port
             struct sockaddr_in6 *la6 = (struct sockaddr_in6 *)&local_addr;
             memset(la6, 0, sizeof(*la6));
             la6->sin6_family = AF_INET6;
-            la6->sin6_addr = in6addr_any;
+            la6->sin6_addr = in6addr_any;  // Could try maddr6 here for multicast-specific bind
             la6->sin6_port = htons(data_port);
+            la6->sin6_scope_id = 0;  // Use 0 for wildcard (will be specified in multicast join)
             if (bind(sockfd, (struct sockaddr *)la6, sizeof(*la6)) < 0) { perror("bind"); ret = 1; goto cleanup; }
+            printf("Bound to [::]:%d\n", data_port);
 
+            // Join multicast group
             memset(&mreq6, 0, sizeof(mreq6));
             mreq6.ipv6mr_multiaddr = maddr6;
-            unsigned int ifindex = 0;
-            if (zone) {
-                char *endp = NULL; unsigned long z = strtoul(zone, &endp, 10);
-                if (zone[0] != '\0' && *endp == '\0') ifindex = (unsigned int)z;
-                else ifindex = if_nametoindex(zone);
-            }
-            if (ifindex == 0 && join_iface_ip) {
-                ifindex = if_nametoindex(join_iface_ip);
-            }
-            if (join_iface_ip && ifindex == 0) {
-                fprintf(stderr, "Invalid IPv6 iface name: %s\n", join_iface_ip);
-                ret = 1; goto cleanup;
-            }
             mreq6.ipv6mr_interface = ifindex;
             if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6)) < 0) {
                 perror("setsockopt (IPV6_ADD_MEMBERSHIP)"); ret = 1; goto cleanup;
+            }
+            printf("Joined IPv6 multicast group on interface: %s (index %u)\n", ifname, ifindex);
+
+            if (verbose) {
+                // Display socket options for diagnostics
+                int v6only = 0;
+                socklen_t optlen = sizeof(v6only);
+                if (getsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &optlen) == 0) {
+                    printf("[VERBOSE] IPV6_V6ONLY: %d\n", v6only);
+                }
+                char mcast_str[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &maddr6, mcast_str, sizeof(mcast_str));
+                printf("[VERBOSE] Multicast group: %s\n", mcast_str);
+                printf("[VERBOSE] Multicast interface index: %u (%s)\n", ifindex, ifname);
             }
         } else {
             fprintf(stderr, "Invalid multicast address (not IPv4 or IPv6): %s\n", mcast_addr_str);
@@ -294,7 +330,7 @@ int main(int argc, char **argv) {
 
         if (rv > 0 && FD_ISSET(sockfd, &rfds)) {
             // Receive the packet
-            struct sockaddr_in src_addr;
+            struct sockaddr_storage src_addr;
             socklen_t src_len = sizeof(src_addr);
             ssize_t nbytes = recvfrom(sockfd, packet, sizeof(packet), 0, (struct sockaddr *)&src_addr, &src_len);
             if (nbytes < 0) {
@@ -302,9 +338,20 @@ int main(int argc, char **argv) {
                 ret = 1;
                 goto cleanup;
             }
-            
+
             struct timeval arrival_time;
             gettimeofday(&arrival_time, NULL);
+
+            if (verbose && first_packet) {
+                char ip_str[INET6_ADDRSTRLEN];
+                int af = ((struct sockaddr *)&src_addr)->sa_family;
+                void *aptr = NULL;
+                if (af == AF_INET) aptr = &((struct sockaddr_in *)&src_addr)->sin_addr;
+                else if (af == AF_INET6) aptr = &((struct sockaddr_in6 *)&src_addr)->sin6_addr;
+                if (aptr && inet_ntop(af, aptr, ip_str, sizeof(ip_str))) {
+                    printf("[VERBOSE] First packet received from %s (%zd bytes)\n", ip_str, nbytes);
+                }
+            }
 
             total_bytes_received += nbytes;
 
@@ -329,6 +376,8 @@ int main(int argc, char **argv) {
             ssize_t sn = sendto(ctrlfd, msg, strlen(msg), 0, (struct sockaddr *)&ctrl_dst, ctrl_dst_len);
             if (sn < 0) {
                 perror("sendto (HELLO)");
+            } else if (verbose) {
+                printf("[VERBOSE] Sent HELLO to control server\n");
             }
             last_hello_time = now;
         }

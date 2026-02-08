@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
     int mcast_loop = 1;
     const char *mcast_iface_ip = NULL; // optional interface (IPv4 addr for v4, ifname for v6)
     int always_send = 0; // if set, bypass control-plane and send unconditionally
+    int verbose = 0; // verbose diagnostics
     double *inter_send_times = malloc(MAX_PACKETS * sizeof(double));
     if (inter_send_times == NULL) {
         perror("malloc");
@@ -148,8 +149,10 @@ int main(int argc, char **argv) {
             mcast_iface_ip = argv[++i];
         } else if (strcmp(argv[i], "--always-send") == 0) {
             always_send = 1;
+        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE] [--always-send]\n", argv[0]);
+            printf("Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE] [--always-send] [--verbose|-v]\n", argv[0]);
             ret = 0;
             goto cleanup;
         } else {
@@ -273,6 +276,19 @@ int main(int argc, char **argv) {
                 ret = 1;
                 goto cleanup;
             }
+
+            // Bind to local address to ensure socket is associated with interface
+            struct sockaddr_in6 bind_addr;
+            memset(&bind_addr, 0, sizeof(bind_addr));
+            bind_addr.sin6_family = AF_INET6;
+            bind_addr.sin6_addr = in6addr_any;
+            bind_addr.sin6_port = 0; // Let OS choose ephemeral port
+            if (bind(sockfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+                perror("bind (IPv6 data socket)");
+                ret = 1;
+                goto cleanup;
+            }
+
             struct sockaddr_in6 *dst6 = (struct sockaddr_in6 *)&multicast_addr;
             memset(dst6, 0, sizeof(*dst6));
             dst6->sin6_family = AF_INET6;
@@ -310,6 +326,12 @@ int main(int argc, char **argv) {
                     ret = 1;
                     goto cleanup;
                 }
+                char ifname[IF_NAMESIZE];
+                if (if_indextoname(ifindex, ifname)) {
+                    printf("Using IPv6 multicast interface: %s (index %u)\n", ifname, ifindex);
+                } else {
+                    fprintf(stderr, "Warning: Could not resolve interface index %u to name\n", ifindex);
+                }
                 if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifindex, sizeof(ifindex)) < 0) {
                     perror("setsockopt (IPV6_MULTICAST_IF)");
                     ret = 1;
@@ -333,6 +355,18 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (verbose) {
+        printf("[VERBOSE] Configuration:\n");
+        printf("[VERBOSE]   Client timeout: %.1f seconds\n", client_timeout_s);
+        printf("[VERBOSE]   Multicast TTL/Hops: %d\n", mcast_ttl);
+        printf("[VERBOSE]   Multicast loopback: %d\n", mcast_loop);
+        if (always_send) {
+            printf("[VERBOSE]   Mode: Always send (no control plane)\n");
+        } else {
+            printf("[VERBOSE]   Mode: Send only when clients connected\n");
+        }
+    }
+
     // Get the start time
     gettimeofday(&start_time, NULL);
 
@@ -349,11 +383,31 @@ int main(int argc, char **argv) {
                 int idx = find_client(clients, client_count, (struct sockaddr *)&src_addr);
                 if (idx >= 0) {
                     clients[idx].last_seen = now;
+                    if (verbose) {
+                        char ip_str[INET6_ADDRSTRLEN];
+                        int af = ((struct sockaddr *)&src_addr)->sa_family;
+                        void *aptr = NULL;
+                        if (af == AF_INET) aptr = &((struct sockaddr_in *)&src_addr)->sin_addr;
+                        else if (af == AF_INET6) aptr = &((struct sockaddr_in6 *)&src_addr)->sin6_addr;
+                        if (aptr && inet_ntop(af, aptr, ip_str, sizeof(ip_str))) {
+                            printf("[VERBOSE] HELLO from existing client %s\n", ip_str);
+                        }
+                    }
                 } else if (client_count < MAX_CLIENTS) {
                     clients[client_count].addrlen = src_len;
                     memcpy(&clients[client_count].addr, &src_addr, src_len);
                     clients[client_count].last_seen = now;
                     client_count++;
+                    if (verbose) {
+                        char ip_str[INET6_ADDRSTRLEN];
+                        int af = ((struct sockaddr *)&src_addr)->sa_family;
+                        void *aptr = NULL;
+                        if (af == AF_INET) aptr = &((struct sockaddr_in *)&src_addr)->sin_addr;
+                        else if (af == AF_INET6) aptr = &((struct sockaddr_in6 *)&src_addr)->sin6_addr;
+                        if (aptr && inet_ntop(af, aptr, ip_str, sizeof(ip_str))) {
+                            printf("[VERBOSE] New client connected: %s (total: %d)\n", ip_str, client_count);
+                        }
+                    }
                 } else {
                     // Rate-limited logging when max clients reached
                     if (elapsed_since(&now, &last_max_clients_log) >= LOG_THROTTLE_S) {
@@ -444,6 +498,23 @@ int main(int argc, char **argv) {
 
         if (elapsed_time >= SEND_INTERVAL_S) {
             if (total_bytes_sent > 0 || send_count > 0) {
+                printf("Connected clients: %d\n", client_count);
+                if (client_count > 0) {
+                    printf("Client list:\n");
+                    for (int i = 0; i < client_count; i++) {
+                        char ip_str[INET6_ADDRSTRLEN];
+                        int af = ((struct sockaddr *)&clients[i].addr)->sa_family;
+                        void *aptr = NULL;
+                        if (af == AF_INET) {
+                            aptr = &((struct sockaddr_in *)&clients[i].addr)->sin_addr;
+                        } else if (af == AF_INET6) {
+                            aptr = &((struct sockaddr_in6 *)&clients[i].addr)->sin6_addr;
+                        }
+                        if (aptr && inet_ntop(af, aptr, ip_str, sizeof(ip_str))) {
+                            printf("  [%d] %s\n", i + 1, ip_str);
+                        }
+                    }
+                }
                 double throughput_mbps = (total_bytes_sent * 8) / (elapsed_time * 1e6);
                 printf("Throughput: %.2f Mbps\n", throughput_mbps);
 
