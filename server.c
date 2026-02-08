@@ -1,3 +1,8 @@
+#if defined(__linux__)
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,7 +230,7 @@ int main(int argc, char **argv) {
         struct in_addr maddr4;
         struct in6_addr maddr6;
         // Support IPv6 zone-id in mcast addr, e.g., ff15::1234%en0
-        char addrbuf[INET6_ADDRSTRLEN + IFNAMSIZ + 4];
+        char addrbuf[INET6_ADDRSTRLEN + IF_NAMESIZE + 4];
         strncpy(addrbuf, mcast_addr_str, sizeof(addrbuf) - 1);
         addrbuf[sizeof(addrbuf) - 1] = '\0';
         char *zone = NULL;
