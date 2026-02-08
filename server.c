@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <net/if.h>
 
 #define MULTICAST_ADDR "239.0.0.1"
 #define PORT 12345
@@ -19,6 +20,7 @@
 #define MAX_CLIENTS 128
 #define MAX_PACKETS 2000000 // Up to 2M packets per 5s interval
 #define LOOP_SLEEP_NS 100000 // 100us
+#define LOG_THROTTLE_S 5.0 // Rate limit logs to once per 5 seconds
 #include "common.h" // Include common.h
 #include <limits.h> // For LONG_MIN, LONG_MAX
 
@@ -43,13 +45,28 @@ static long parse_long(const char *s, const char *arg_name, int *error_flag) {
 
 
 struct client_entry {
-    in_addr_t ip;
+    struct sockaddr_storage addr;  // store IPv4 or IPv6 address
+    socklen_t addrlen;
     struct timeval last_seen;
 };
 
-static int find_client(struct client_entry *clients, int count, in_addr_t ip) {
+static int sockaddr_equal_addronly(const struct sockaddr *a, const struct sockaddr *b) {
+    if (a->sa_family != b->sa_family) return 0;
+    if (a->sa_family == AF_INET) {
+        const struct sockaddr_in *ia = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *ib = (const struct sockaddr_in *)b;
+        return ia->sin_addr.s_addr == ib->sin_addr.s_addr;
+    } else if (a->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *ia6 = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *ib6 = (const struct sockaddr_in6 *)b;
+        return memcmp(&ia6->sin6_addr, &ib6->sin6_addr, sizeof(struct in6_addr)) == 0;
+    }
+    return 0;
+}
+
+static int find_client(struct client_entry *clients, int count, const struct sockaddr *addr) {
     for (int i = 0; i < count; i++) {
-        if (clients[i].ip == ip) {
+        if (sockaddr_equal_addronly((const struct sockaddr *)&clients[i].addr, addr)) {
             return i;
         }
     }
@@ -62,10 +79,12 @@ static double elapsed_since(const struct timeval *now, const struct timeval *the
 
 int main(int argc, char **argv) {
     int ret = 0;
-    int sockfd = -1;
-    int ctrlfd = -1;
-    struct sockaddr_in multicast_addr;
-    struct sockaddr_in ctrl_addr;
+    int sockfd = -1;   // data socket (IPv4 or IPv6)
+    int ctrlfd = -1;   // control socket (prefer dual-stack IPv6)
+    struct sockaddr_storage multicast_addr;
+    int mcast_family = AF_UNSPEC;
+    struct sockaddr_in6 ctrl6_addr;
+    struct sockaddr_in ctrl4_addr;
     char packet[PACKET_SIZE];
     long long total_bytes_sent = 0;
     struct timeval start_time, current_time;
@@ -77,7 +96,8 @@ int main(int argc, char **argv) {
     const char *mcast_addr_str = MULTICAST_ADDR;
     int mcast_ttl = 1;
     int mcast_loop = 1;
-    const char *mcast_iface_ip = NULL; // optional interface IP
+    const char *mcast_iface_ip = NULL; // optional interface (IPv4 addr for v4, ifname for v6)
+    int always_send = 0; // if set, bypass control-plane and send unconditionally
     double *inter_send_times = malloc(MAX_PACKETS * sizeof(double));
     if (inter_send_times == NULL) {
         perror("malloc");
@@ -88,6 +108,8 @@ int main(int argc, char **argv) {
     struct timeval last_send_time;
     int first_send = 1;
     int parse_error = 0; // Flag to indicate parsing errors
+    struct timeval last_max_clients_log = {0, 0};
+    struct timeval last_timeout_log = {0, 0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--client-timeout") == 0 && i + 1 < argc) {
@@ -124,8 +146,10 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--iface") == 0 && i + 1 < argc) {
             mcast_iface_ip = argv[++i];
+        } else if (strcmp(argv[i], "--always-send") == 0) {
+            always_send = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE_IP]\n", argv[0]);
+            printf("Usage: %s [--client-timeout SECONDS] [--ctrl-port PORT] [--data-port PORT] [--mcast-addr ADDR] [--ttl N] [--loop 0|1] [--iface IFACE] [--always-send]\n", argv[0]);
             ret = 0;
             goto cleanup;
         } else {
@@ -141,82 +165,171 @@ int main(int argc, char **argv) {
     }
 
 
-    // Create a UDP socket
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket");
-        ret = 1;
-        goto cleanup;
-    }
-
-    // Create control socket
-    if ((ctrlfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket (control)");
-        ret = 1;
-        goto cleanup;
-    }
-
-    memset(&ctrl_addr, 0, sizeof(ctrl_addr));
-    ctrl_addr.sin_family = AF_INET;
-    ctrl_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    ctrl_addr.sin_port = htons(ctrl_port);
-    if (bind(ctrlfd, (struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr)) < 0) {
-        perror("bind (control)");
-        ret = 1;
-        goto cleanup;
+    // Create control socket: prefer IPv6 dual-stack (unless always_send)
+    if (!always_send) {
+        int v6only = 0;
+        ctrlfd = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (ctrlfd >= 0) {
+            if (setsockopt(ctrlfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0) {
+                // If disabling v6only fails, we still continue with pure v6
+            }
+            memset(&ctrl6_addr, 0, sizeof(ctrl6_addr));
+            ctrl6_addr.sin6_family = AF_INET6;
+            ctrl6_addr.sin6_addr = in6addr_any;
+            ctrl6_addr.sin6_port = htons(ctrl_port);
+            if (bind(ctrlfd, (struct sockaddr *)&ctrl6_addr, sizeof(ctrl6_addr)) < 0) {
+                // Fallback to IPv4 control
+                close(ctrlfd);
+                ctrlfd = -1;
+            }
+        }
+        if (ctrlfd < 0) {
+            ctrlfd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (ctrlfd < 0) {
+                perror("socket (control)");
+                ret = 1;
+                goto cleanup;
+            }
+            int reuse = 1;
+            setsockopt(ctrlfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            memset(&ctrl4_addr, 0, sizeof(ctrl4_addr));
+            ctrl4_addr.sin_family = AF_INET;
+            ctrl4_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            ctrl4_addr.sin_port = htons(ctrl_port);
+            if (bind(ctrlfd, (struct sockaddr *)&ctrl4_addr, sizeof(ctrl4_addr)) < 0) {
+                perror("bind (control)");
+                ret = 1;
+                goto cleanup;
+            }
+        }
     }
 
     // Make control socket non-blocking so it doesn't rate-limit sends
-    int flags = fcntl(ctrlfd, F_GETFL, 0);
-    if (flags < 0 || fcntl(ctrlfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        perror("fcntl (O_NONBLOCK)");
-        ret = 1;
-        goto cleanup;
+    if (!always_send && ctrlfd >= 0) {
+        int flags = fcntl(ctrlfd, F_GETFL, 0);
+        if (flags < 0 || fcntl(ctrlfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            perror("fcntl (O_NONBLOCK)");
+            ret = 1;
+            goto cleanup;
+        }
     }
 
     // Initialize packet payload to a fixed pattern
     memset(packet, 0, sizeof(packet));
 
-    // Set up the multicast address
-    memset(&multicast_addr, 0, sizeof(multicast_addr));
-    multicast_addr.sin_family = AF_INET;
-    struct in_addr maddr;
-    if (inet_aton(mcast_addr_str, &maddr) == 0) {
-        fprintf(stderr, "Invalid multicast address: %s\n", mcast_addr_str);
-        ret = 1;
-        goto cleanup;
-    }
-    multicast_addr.sin_addr = maddr;
-    multicast_addr.sin_port = htons(data_port);
-
-    printf("Server sending to %s:%d\n", mcast_addr_str, data_port);
-    printf("Control listening on 0.0.0.0:%d\n", ctrl_port);
-
-    // Configure multicast options
+    // Determine multicast address family and configure socket/options
     {
-        unsigned char ttl_uc = (unsigned char)(mcast_ttl < 0 ? 0 : (mcast_ttl > 255 ? 255 : mcast_ttl));
-        if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl_uc, sizeof(ttl_uc)) < 0) {
-            perror("setsockopt (IP_MULTICAST_TTL)");
-            ret = 1;
-            goto cleanup;
-        }
-        unsigned char loop_uc = (unsigned char)(mcast_loop ? 1 : 0);
-        if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop_uc, sizeof(loop_uc)) < 0) {
-            perror("setsockopt (IP_MULTICAST_LOOP)");
-            ret = 1;
-            goto cleanup;
-        }
-        if (mcast_iface_ip) {
-            struct in_addr ifaddr;
-            if (inet_aton(mcast_iface_ip, &ifaddr) == 0) {
-                fprintf(stderr, "Invalid iface IP: %s\n", mcast_iface_ip);
+        struct in_addr maddr4;
+        struct in6_addr maddr6;
+        // Support IPv6 zone-id in mcast addr, e.g., ff15::1234%en0
+        char addrbuf[INET6_ADDRSTRLEN + IFNAMSIZ + 4];
+        strncpy(addrbuf, mcast_addr_str, sizeof(addrbuf) - 1);
+        addrbuf[sizeof(addrbuf) - 1] = '\0';
+        char *zone = NULL;
+        char *percent = strchr(addrbuf, '%');
+        if (percent) { *percent = '\0'; zone = percent + 1; }
+        if (inet_pton(AF_INET, addrbuf, &maddr4) == 1) {
+            mcast_family = AF_INET;
+            if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+                perror("socket");
                 ret = 1;
                 goto cleanup;
             }
-            if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr)) < 0) {
-                perror("setsockopt (IP_MULTICAST_IF)");
+            struct sockaddr_in *dst4 = (struct sockaddr_in *)&multicast_addr;
+            memset(dst4, 0, sizeof(*dst4));
+            dst4->sin_family = AF_INET;
+            dst4->sin_addr = maddr4;
+            dst4->sin_port = htons(data_port);
+
+            unsigned char ttl_uc = (unsigned char)(mcast_ttl < 0 ? 0 : (mcast_ttl > 255 ? 255 : mcast_ttl));
+            if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl_uc, sizeof(ttl_uc)) < 0) {
+                perror("setsockopt (IP_MULTICAST_TTL)");
                 ret = 1;
                 goto cleanup;
             }
+            unsigned char loop_uc = (unsigned char)(mcast_loop ? 1 : 0);
+            if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop_uc, sizeof(loop_uc)) < 0) {
+                perror("setsockopt (IP_MULTICAST_LOOP)");
+                ret = 1;
+                goto cleanup;
+            }
+            if (mcast_iface_ip) {
+                struct in_addr ifaddr;
+                if (inet_aton(mcast_iface_ip, &ifaddr) == 0) {
+                    fprintf(stderr, "Invalid IPv4 iface IP: %s\n", mcast_iface_ip);
+                    ret = 1;
+                    goto cleanup;
+                }
+                if (setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr)) < 0) {
+                    perror("setsockopt (IP_MULTICAST_IF)");
+                    ret = 1;
+                    goto cleanup;
+                }
+            }
+        } else if (inet_pton(AF_INET6, addrbuf, &maddr6) == 1) {
+            mcast_family = AF_INET6;
+            if ((sockfd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
+                perror("socket");
+                ret = 1;
+                goto cleanup;
+            }
+            struct sockaddr_in6 *dst6 = (struct sockaddr_in6 *)&multicast_addr;
+            memset(dst6, 0, sizeof(*dst6));
+            dst6->sin6_family = AF_INET6;
+            dst6->sin6_addr = maddr6;
+            dst6->sin6_port = htons(data_port);
+
+            int hops = mcast_ttl;
+            if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops)) < 0) {
+                perror("setsockopt (IPV6_MULTICAST_HOPS)");
+                ret = 1;
+                goto cleanup;
+            }
+            unsigned int loop_uc = (unsigned int)(mcast_loop ? 1 : 0);
+            if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &loop_uc, sizeof(loop_uc)) < 0) {
+                perror("setsockopt (IPV6_MULTICAST_LOOP)");
+                ret = 1;
+                goto cleanup;
+            }
+            if (zone || mcast_iface_ip) {
+                unsigned int ifindex = 0;
+                if (zone) {
+                    // zone may be numeric or ifname
+                    char *endp = NULL; unsigned long z = strtoul(zone, &endp, 10);
+                    if (zone[0] != '\0' && *endp == '\0') {
+                        ifindex = (unsigned int)z;
+                    } else {
+                        ifindex = if_nametoindex(zone);
+                    }
+                }
+                if (ifindex == 0 && mcast_iface_ip) {
+                    ifindex = if_nametoindex(mcast_iface_ip);
+                }
+                if (ifindex == 0) {
+                    fprintf(stderr, "Invalid IPv6 interface (zone '%s', iface '%s')\n", zone ? zone : "", mcast_iface_ip ? mcast_iface_ip : "");
+                    ret = 1;
+                    goto cleanup;
+                }
+                if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifindex, sizeof(ifindex)) < 0) {
+                    perror("setsockopt (IPV6_MULTICAST_IF)");
+                    ret = 1;
+                    goto cleanup;
+                }
+                ((struct sockaddr_in6 *)&multicast_addr)->sin6_scope_id = ifindex; // helpful for link-local
+            }
+        } else {
+            fprintf(stderr, "Invalid multicast address (not IPv4 or IPv6): %s\n", mcast_addr_str);
+            ret = 1;
+            goto cleanup;
+        }
+    }
+
+    printf("Server sending to %s:%d (%s)\n", mcast_addr_str, data_port, mcast_family == AF_INET6 ? "IPv6" : "IPv4");
+    if (!always_send && ctrlfd >= 0) {
+        if (((struct sockaddr *)&ctrl6_addr)->sa_family == AF_INET6) {
+            printf("Control listening on [::]:%d (dual-stack if supported)\n", ctrl_port);
+        } else {
+            printf("Control listening on 0.0.0.0:%d\n", ctrl_port);
         }
     }
 
@@ -225,23 +338,34 @@ int main(int argc, char **argv) {
 
     while (1) {
         for (;;) {
+            if (always_send) break; // skip control-plane when always_send
             char buf[16];
-            struct sockaddr_in src_addr;
+            struct sockaddr_storage src_addr;
             socklen_t src_len = sizeof(src_addr);
             ssize_t n = recvfrom(ctrlfd, buf, sizeof(buf), 0, (struct sockaddr *)&src_addr, &src_len);
             if (n >= 0) {
                 struct timeval now;
                 gettimeofday(&now, NULL);
-                int idx = find_client(clients, client_count, src_addr.sin_addr.s_addr);
+                int idx = find_client(clients, client_count, (struct sockaddr *)&src_addr);
                 if (idx >= 0) {
                     clients[idx].last_seen = now;
                 } else if (client_count < MAX_CLIENTS) {
-                    clients[client_count].ip = src_addr.sin_addr.s_addr;
+                    clients[client_count].addrlen = src_len;
+                    memcpy(&clients[client_count].addr, &src_addr, src_len);
                     clients[client_count].last_seen = now;
                     client_count++;
                 } else {
-                    // Optionally, log that max clients has been reached
-                    fprintf(stderr, "Max clients reached, ignoring new client from %s\n", inet_ntoa(src_addr.sin_addr));
+                    // Rate-limited logging when max clients reached
+                    if (elapsed_since(&now, &last_max_clients_log) >= LOG_THROTTLE_S) {
+                        char ip_str[INET6_ADDRSTRLEN];
+                        void *aptr = NULL; int af = ((struct sockaddr *)&src_addr)->sa_family;
+                        if (af == AF_INET) aptr = &((struct sockaddr_in *)&src_addr)->sin_addr;
+                        else if (af == AF_INET6) aptr = &((struct sockaddr_in6 *)&src_addr)->sin6_addr;
+                        inet_ntop(af, aptr, ip_str, sizeof(ip_str));
+                        fprintf(stderr, "Max clients (%d) reached, ignoring new connections (e.g., %s)\n",
+                                MAX_CLIENTS, ip_str);
+                        last_max_clients_log = now;
+                    }
                 }
                 continue;
             }
@@ -258,7 +382,7 @@ int main(int argc, char **argv) {
         // Check for active clients and remove timed out ones
         struct timeval now;
         gettimeofday(&now, NULL);
-        int active = 0;
+        int active = always_send ? 1 : 0;
         int i = 0;
         while (i < client_count) {
             if (elapsed_since(&now, &clients[i].last_seen) <= client_timeout_s) {
@@ -266,7 +390,18 @@ int main(int argc, char **argv) {
                 i++;
             } else {
                 // Client timed out, remove it by shifting subsequent elements
-                fprintf(stderr, "Client %s timed out.\n", inet_ntoa((struct in_addr){clients[i].ip}));
+                // Rate-limited logging to avoid spam during mass disconnects
+                if (elapsed_since(&now, &last_timeout_log) >= LOG_THROTTLE_S) {
+                    char ip_str[INET6_ADDRSTRLEN];
+                    int af = ((struct sockaddr *)&clients[i].addr)->sa_family;
+                    void *aptr = NULL;
+                    if (af == AF_INET) aptr = &((struct sockaddr_in *)&clients[i].addr)->sin_addr;
+                    else if (af == AF_INET6) aptr = &((struct sockaddr_in6 *)&clients[i].addr)->sin6_addr;
+                    inet_ntop(af, aptr, ip_str, sizeof(ip_str));
+                    fprintf(stderr, "Client %s timed out (future timeouts throttled for %.0fs).\n",
+                            ip_str, LOG_THROTTLE_S);
+                    last_timeout_log = now;
+                }
                 client_count--;
                 for (int j = i; j < client_count; j++) {
                     clients[j] = clients[j+1];
@@ -275,7 +410,8 @@ int main(int argc, char **argv) {
         }
 
         if (active > 0) {
-            if (sendto(sockfd, packet, sizeof(packet), 0, (struct sockaddr *)&multicast_addr, sizeof(multicast_addr)) < 0) {
+            socklen_t dlen = (mcast_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+            if (sendto(sockfd, packet, sizeof(packet), 0, (struct sockaddr *)&multicast_addr, dlen) < 0) {
                 perror("sendto");
                 ret = 1;
                 goto cleanup;

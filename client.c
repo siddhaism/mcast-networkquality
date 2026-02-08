@@ -7,6 +7,12 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <errno.h> // Added for errno and ERANGE
+#include <net/if.h>
+#include <netdb.h>
+
+#ifndef IPV6_ADD_MEMBERSHIP
+#define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP
+#endif
 
 #define MULTICAST_ADDR "239.0.0.1"
 #define PORT 12345
@@ -38,9 +44,12 @@ int main(int argc, char **argv) {
     int ret = 0;
     int sockfd = -1;
     int ctrlfd = -1;
-    struct sockaddr_in local_addr;
+    int data_family = AF_UNSPEC;
+    struct sockaddr_storage local_addr;
     struct ip_mreq mreq;
-    struct sockaddr_in ctrl_srv;
+    struct ipv6_mreq mreq6;
+    struct sockaddr_storage ctrl_dst;
+    socklen_t ctrl_dst_len = 0;
     char packet[PACKET_SIZE];
     long long total_bytes_received = 0;
     struct timeval start_time, current_time, last_packet_time, last_hello_time;
@@ -111,94 +120,141 @@ int main(int argc, char **argv) {
     }
     long packet_count = 0;
 
+    // defer creating data socket until we know address family
 
-
-    // Create a UDP socket
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket");
-        ret = 1;
-        goto cleanup;
-    }
-
-    // Control socket for HELLOs
-    if ((ctrlfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket (control)");
-        ret = 1;
-        goto cleanup;
-    }
-
-    const char *server_ip = ctrl_ip_arg;
-    if (server_ip == NULL) {
-        server_ip = getenv("CTRL_SERVER_IP");
-    }
-    if (server_ip == NULL) {
-        server_ip = "127.0.0.1";
-    }
-    memset(&ctrl_srv, 0, sizeof(ctrl_srv));
-    ctrl_srv.sin_family = AF_INET;
-    ctrl_srv.sin_addr.s_addr = inet_addr(server_ip);
-    ctrl_srv.sin_port = htons(ctrl_port);
-
-    // Allow multiple sockets to use the same port
-    int reuse = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse)) < 0) {
-        perror("setsockopt (SO_REUSEADDR)");
-        ret = 1;
-        goto cleanup;
-    }
-
-#ifdef SO_REUSEPORT
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, (char *)&reuse, sizeof(reuse)) < 0) {
-        fprintf(stderr, "Warning: setsockopt (SO_REUSEPORT) failed: %s. Continuing without it.\n", strerror(errno));
-    }
-#endif
-
-    // Configure receive buffer
+    // Resolve control destination and create control socket
     {
-        int rcvbuf = (rcvbuf_cli > 0) ? rcvbuf_cli : (4 * 1024 * 1024); // default 4MB
-        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-            perror("setsockopt (SO_RCVBUF)");
+        const char *server_ip = ctrl_ip_arg;
+        if (server_ip == NULL) server_ip = getenv("CTRL_SERVER_IP");
+        if (server_ip == NULL) server_ip = "127.0.0.1";
+
+        char portstr[16];
+        snprintf(portstr, sizeof(portstr), "%d", ctrl_port);
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_flags = AI_NUMERICHOST; // literal only to avoid DNS
+        int gai = getaddrinfo(server_ip, portstr, &hints, &res);
+        if (gai != 0) {
+            fprintf(stderr, "Invalid --ctrl-ip literal '%s': %s\n", server_ip, gai_strerror(gai));
+            ret = 1;
+            goto cleanup;
         }
-        socklen_t optlen = sizeof(rcvbuf);
-        if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) == 0) {
-            printf("Effective SO_RCVBUF: %d bytes\n", rcvbuf);
+        ctrlfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (ctrlfd < 0) {
+            perror("socket (control)");
+            freeaddrinfo(res);
+            ret = 1;
+            goto cleanup;
+        }
+        memcpy(&ctrl_dst, res->ai_addr, res->ai_addrlen);
+        ctrl_dst_len = (socklen_t)res->ai_addrlen;
+        char addrbuf[INET6_ADDRSTRLEN];
+        void *aptr = NULL; const char *fam = res->ai_family == AF_INET6 ? "IPv6" : "IPv4";
+        if (res->ai_family == AF_INET) aptr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
+        else aptr = &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
+        inet_ntop(res->ai_family, aptr, addrbuf, sizeof(addrbuf));
+        printf("Control sending to %s:%d (%s)\n", addrbuf, ctrl_port, fam);
+        freeaddrinfo(res);
+    }
+
+    // data socket options will be applied after creating it below (per family)
+
+    // Determine multicast family and configure socket, bind, and join
+    {
+        struct in_addr maddr4; struct in6_addr maddr6;
+        char addrbuf[INET6_ADDRSTRLEN + IFNAMSIZ + 4];
+        strncpy(addrbuf, mcast_addr_str, sizeof(addrbuf) - 1);
+        addrbuf[sizeof(addrbuf) - 1] = '\0';
+        char *zone = NULL; char *percent = strchr(addrbuf, '%');
+        if (percent) { *percent = '\0'; zone = percent + 1; }
+        if (inet_pton(AF_INET, addrbuf, &maddr4) == 1) {
+            data_family = AF_INET;
+            if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) { perror("socket"); ret = 1; goto cleanup; }
+            // Allow multiple sockets and configure rcvbuf
+            int reuse = 1;
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse)) < 0) { perror("setsockopt (SO_REUSEADDR)"); ret = 1; goto cleanup; }
+#ifdef SO_REUSEPORT
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, (char *)&reuse, sizeof(reuse)) < 0) {
+                fprintf(stderr, "Warning: setsockopt (SO_REUSEPORT) failed: %s. Continuing without it.\n", strerror(errno));
+            }
+#endif
+            {
+                int rcvbuf = (rcvbuf_cli > 0) ? rcvbuf_cli : (4 * 1024 * 1024);
+                if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) { perror("setsockopt (SO_RCVBUF)"); }
+                socklen_t optlen = sizeof(rcvbuf);
+                if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) == 0) {
+                    printf("Effective SO_RCVBUF: %d bytes\n", rcvbuf);
+                }
+            }
+            struct sockaddr_in *la = (struct sockaddr_in *)&local_addr;
+            memset(la, 0, sizeof(*la));
+            la->sin_family = AF_INET;
+            la->sin_addr.s_addr = htonl(INADDR_ANY);
+            la->sin_port = htons(data_port);
+            if (bind(sockfd, (struct sockaddr *)la, sizeof(*la)) < 0) { perror("bind"); ret = 1; goto cleanup; }
+
+            mreq.imr_multiaddr = maddr4;
+            if (join_iface_ip) {
+                mreq.imr_interface.s_addr = inet_addr(join_iface_ip);
+            } else {
+                mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+            }
+            if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+                perror("setsockopt (IP_ADD_MEMBERSHIP)"); ret = 1; goto cleanup;
+            }
+        } else if (inet_pton(AF_INET6, addrbuf, &maddr6) == 1) {
+            data_family = AF_INET6;
+            if ((sockfd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) { perror("socket"); ret = 1; goto cleanup; }
+            // Allow multiple sockets and configure rcvbuf
+            int reuse = 1;
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse)) < 0) { perror("setsockopt (SO_REUSEADDR)"); ret = 1; goto cleanup; }
+#ifdef SO_REUSEPORT
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, (char *)&reuse, sizeof(reuse)) < 0) {
+                fprintf(stderr, "Warning: setsockopt (SO_REUSEPORT) failed: %s. Continuing without it.\n", strerror(errno));
+            }
+#endif
+            {
+                int rcvbuf = (rcvbuf_cli > 0) ? rcvbuf_cli : (4 * 1024 * 1024);
+                if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) { perror("setsockopt (SO_RCVBUF)"); }
+                socklen_t optlen = sizeof(rcvbuf);
+                if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) == 0) {
+                    printf("Effective SO_RCVBUF: %d bytes\n", rcvbuf);
+                }
+            }
+            struct sockaddr_in6 *la6 = (struct sockaddr_in6 *)&local_addr;
+            memset(la6, 0, sizeof(*la6));
+            la6->sin6_family = AF_INET6;
+            la6->sin6_addr = in6addr_any;
+            la6->sin6_port = htons(data_port);
+            if (bind(sockfd, (struct sockaddr *)la6, sizeof(*la6)) < 0) { perror("bind"); ret = 1; goto cleanup; }
+
+            memset(&mreq6, 0, sizeof(mreq6));
+            mreq6.ipv6mr_multiaddr = maddr6;
+            unsigned int ifindex = 0;
+            if (zone) {
+                char *endp = NULL; unsigned long z = strtoul(zone, &endp, 10);
+                if (zone[0] != '\0' && *endp == '\0') ifindex = (unsigned int)z;
+                else ifindex = if_nametoindex(zone);
+            }
+            if (ifindex == 0 && join_iface_ip) {
+                ifindex = if_nametoindex(join_iface_ip);
+            }
+            if (join_iface_ip && ifindex == 0) {
+                fprintf(stderr, "Invalid IPv6 iface name: %s\n", join_iface_ip);
+                ret = 1; goto cleanup;
+            }
+            mreq6.ipv6mr_interface = ifindex;
+            if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6)) < 0) {
+                perror("setsockopt (IPV6_ADD_MEMBERSHIP)"); ret = 1; goto cleanup;
+            }
+        } else {
+            fprintf(stderr, "Invalid multicast address (not IPv4 or IPv6): %s\n", mcast_addr_str);
+            ret = 1; goto cleanup;
         }
     }
 
-    // Set up the local address
-    memset(&local_addr, 0, sizeof(local_addr));
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    local_addr.sin_port = htons(data_port);
-
-    // Bind to the local address
-    if (bind(sockfd, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        perror("bind");
-        ret = 1;
-        goto cleanup;
-    }
-
-    // Join the multicast group
-    struct in_addr maddr;
-    if (inet_aton(mcast_addr_str, &maddr) == 0) {
-        fprintf(stderr, "Invalid multicast address: %s\n", mcast_addr_str);
-        ret = 1;
-        goto cleanup;
-    }
-    mreq.imr_multiaddr = maddr;
-    if (join_iface_ip) {
-        mreq.imr_interface.s_addr = inet_addr(join_iface_ip);
-    } else {
-        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-    }
-    if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        perror("setsockopt (IP_ADD_MEMBERSHIP)");
-        ret = 1;
-        goto cleanup;
-    }
-
-    printf("Client listening on %s:%d\n", mcast_addr_str, data_port);
-    printf("Control sending to %s:%d (set CTRL_SERVER_IP to override)\n", server_ip, ctrl_port);
+    printf("Client listening on %s:%d (%s)\n", mcast_addr_str, data_port, data_family == AF_INET6 ? "IPv6" : "IPv4");
 
     // Get the start time
     gettimeofday(&start_time, NULL);
@@ -270,7 +326,7 @@ int main(int argc, char **argv) {
                       (now.tv_usec - last_hello_time.tv_usec) / 1e6;
         if (since_hello >= hello_interval_s) {
             const char *msg = "HELLO";
-            ssize_t sn = sendto(ctrlfd, msg, strlen(msg), 0, (struct sockaddr *)&ctrl_srv, sizeof(ctrl_srv));
+            ssize_t sn = sendto(ctrlfd, msg, strlen(msg), 0, (struct sockaddr *)&ctrl_dst, ctrl_dst_len);
             if (sn < 0) {
                 perror("sendto (HELLO)");
             }
@@ -298,6 +354,8 @@ int main(int argc, char **argv) {
                     double p99 = inter_arrival_times[idx99];
                     printf("Inter-packet arrival (ms): p50: %.2f, p95: %.2f, p99: %.2f\n", p50, p95, p99);
                 }
+            } else {
+                printf("No packets received in the last %.1f seconds\n", elapsed_time);
             }
 
             // Reset counters
